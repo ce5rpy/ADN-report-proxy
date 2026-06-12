@@ -1,0 +1,3 @@
+# adn-report-proxy runtime dependencies (see also pyproject.toml)
+Twisted>=22.0
+pyyaml>=6.0

@@ -1,0 +1,35 @@
+# ADN Report Proxy - example configuration
+# Copyright (C) 2026  Rodrigo Pérez, CE5RPY <ce5rpy@qmd.cl>
+#
+###############################################################################
+#   This program is free software; you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation; either version 3 of the License, or
+#   (at your option) any later version.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program; if not, write to the Free Software Foundation,
+#   Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
+###############################################################################
+#
+# adn-report-proxy — optional legacy report wire adapter
+#
+# Legacy dashboard (dashboard.py / monitor.py) connects to LISTEN.
+# Proxy connects upstream to adn-server 2.x (or v1 passthrough).
+
+UPSTREAM:
+  HOST: "127.0.0.1"
+  PORT: 4321
+  # adn-server REPORTS.REPORT_CLIENTS must allow the proxy host (often 127.0.0.1).
+
+LISTEN:
+  HOST: ""
+  PORT: 4322
+
+LOGGER:
+  LOG_LEVEL: INFO
