@@ -22,16 +22,29 @@
 from __future__ import annotations
 
 import logging
+import pickle
 import time
 from dataclasses import dataclass, field
 
 from ..domain import Opcode
 from .ports import DownstreamBroadcaster, UpstreamCommander, V2ToV1Translator
+from .v2_to_v1_mapper import merge_ua_sessions_into_bridges
+from .wire_log import (
+    opcode_name,
+    summarize_legacy_out_frames,
+    summarize_legacy_request,
+    summarize_snapshot,
+    summarize_upstream,
+)
 
 logger = logging.getLogger("adn-report-proxy")
 
 # Opcodes legacy monitors need on (re)connect before live events.
-_SNAPSHOT_OPCODES = frozenset({b"\xff", b"\x01", b"\x03"})
+# HELLO (0xFF) is v2-only; legacy adn-dmr-server / legacy dashboard never used it.
+_SNAPSHOT_OPCODES = frozenset({b"\x01", b"\x03"})
+
+# Legacy dashboard builds CTABLE from CONFIG before applying BRIDGE (build_tgstats).
+_SNAPSHOT_ORDER = {Opcode.CONFIG_SND: 0, Opcode.BRIDGE_SND: 1}
 
 _DOWNSTREAM_REFRESH_OPCODES = frozenset({
     Opcode.CONFIG_REQ,
@@ -49,6 +62,7 @@ class ProxyState:
     snapshot: list[bytes] = field(default_factory=list)
     last_cache_update_at: float = 0.0
     last_upstream_refresh_at: float = 0.0
+    broadcast_masters: frozenset[str] = field(default_factory=frozenset)
 
 
 class ProxyUseCases:
@@ -73,52 +87,129 @@ class ProxyUseCases:
             return
         opcode = frame[:1]
         payload = frame[1:]
+        logger.info("upstream recv: %s", summarize_upstream(opcode, payload))
         out_frames = self._translator.translate(opcode, payload)
+        if out_frames:
+            logger.info("legacy send: %s", summarize_legacy_out_frames(out_frames))
+        elif opcode not in (Opcode.HELLO,):
+            logger.debug("upstream %s → no legacy frames", opcode_name(opcode))
+        if opcode == Opcode.HELLO and self._translator.upstream_is_v2 and self._upstream is not None:
+            logger.info("upstream send: BRIDGE_REQ (bootstrap routing after v2 HELLO)")
+            self._upstream.request_bridge_refresh()
+        config_frame: bytes | None = None
         for out in out_frames:
+            if out[:1] == Opcode.HELLO:
+                continue
+            if out[:1] == Opcode.CONFIG_SND:
+                config_frame = out
+                continue
             self._maybe_cache(out)
             self._broadcaster.broadcast(out)
+        if config_frame is not None:
+            self._refresh_legacy_static_tg_view(config_frame)
+
+    def _refresh_legacy_static_tg_view(self, config_frame: bytes) -> None:
+        """Legacy dashboard: ``build_tgstats`` runs on BRIDGE_SND only; ``build_stats`` on CONFIG_SND."""
+        config = pickle.loads(config_frame[1:])
+        bridge = self._cached_frame(Opcode.BRIDGE_SND)
+        if bridge is not None:
+            bridges = pickle.loads(bridge[1:])
+            enriched = merge_ua_sessions_into_bridges(bridges, config)
+            bridge_frame = Opcode.BRIDGE_SND + pickle.dumps(enriched)
+            self._maybe_cache(bridge_frame)
+            self._broadcaster.broadcast(bridge_frame)
+        self._publish_config(config_frame)
+
+    def _publish_config(self, config_frame: bytes) -> None:
+        """Broadcast CONFIG; reset clients when master keys change (legacy update_hblink_table)."""
+        masters = self._config_master_names(config_frame)
+        prev = self.state.broadcast_masters
+        self.state.broadcast_masters = masters
+        if prev and masters != prev:
+            logger.info(
+                "legacy CONFIG master set changed (%d → %d names) → reset downstream clients",
+                len(prev),
+                len(masters),
+            )
+            self._broadcaster.disconnect_all()
+        self._maybe_cache(config_frame)
+        self._broadcaster.broadcast(config_frame)
+
+    @staticmethod
+    def _config_master_names(config_frame: bytes) -> frozenset[str]:
+        try:
+            config = pickle.loads(config_frame[1:])
+        except Exception:
+            return frozenset()
+        if not isinstance(config, dict):
+            return frozenset()
+        return frozenset(
+            str(name)
+            for name, entry in config.items()
+            if isinstance(entry, dict) and entry.get("MODE") == "MASTER"
+        )
 
     def handle_downstream_request(self, frame: bytes, client: object | None = None) -> None:
         """Serve CONFIG/BRIDGE from cache; refresh upstream only on cache miss or stale TTL."""
-        if not frame or frame[:1] not in _DOWNSTREAM_REFRESH_OPCODES:
+        if not frame:
             return
         req = frame[:1]
+        if req not in _DOWNSTREAM_REFRESH_OPCODES:
+            logger.debug("legacy recv ignored: %s (%d B)", opcode_name(req), len(frame))
+            return
+        req_label = summarize_legacy_request(req)
         if req == Opcode.CONFIG_REQ:
             cached = self._cached_frame(Opcode.CONFIG_SND)
+            rsp_label = "CONFIG_SND"
         else:
             cached = self._cached_frame(Opcode.BRIDGE_SND)
+            rsp_label = "BRIDGE_SND"
 
         if cached is not None and client is not None:
             self._broadcaster.send_snapshot(client, [cached])
-            logger.debug("legacy %s served from cache", req.hex())
+            logger.info(
+                "legacy request: %s → replied %s from cache (%s)",
+                req_label,
+                rsp_label,
+                summarize_upstream(cached[:1], cached[1:]),
+            )
             self._maybe_refresh_upstream(stale_only=True)
             return
 
         if self._upstream is None:
-            logger.debug("legacy %s ignored (no upstream, cache empty)", req.hex())
+            logger.info("legacy request: %s → no reply (no upstream, cache empty)", req_label)
             return
 
-        logger.debug("legacy %s cache miss → upstream refresh", req.hex())
+        upstream_req = "STATE_REQ" if self._translator.upstream_is_v2 else req_label
+        logger.info(
+            "legacy request: %s → cache miss, upstream send %s",
+            req_label,
+            upstream_req,
+        )
         self._request_upstream_refresh(req)
         self._mark_upstream_refresh()
 
     def snapshot_for_client(self) -> list[bytes]:
-        return list(self.state.snapshot)
+        return sorted(
+            self.state.snapshot,
+            key=lambda frame: _SNAPSHOT_ORDER.get(frame[:1], 99),
+        )
 
     def on_downstream_connected(self, client: object) -> None:
         frames = self.snapshot_for_client()
         if frames:
             self._broadcaster.send_snapshot(client, frames)
-            logger.info("replayed %d cached v1 frame(s) to new legacy client", len(frames))
+            logger.info(
+                "legacy connect → replay snapshot: %s (%d frame(s))",
+                summarize_snapshot(frames),
+                len(frames),
+            )
         else:
-            logger.info("legacy client connected; no snapshot cached yet")
+            logger.info("legacy connect → no snapshot cached yet")
 
     def on_upstream_lost(self) -> None:
-        logger.warning("upstream server connection lost; clearing snapshot cache")
-        self._translator.reset()
-        self.state.snapshot.clear()
-        self.state.last_cache_update_at = 0.0
-        self.state.last_upstream_refresh_at = 0.0
+        logger.warning("upstream server connection lost; keeping legacy snapshot cache")
+        self._translator.on_upstream_lost()
 
     def _cached_frame(self, opcode: bytes) -> bytes | None:
         for frame in reversed(self.state.snapshot):
@@ -148,7 +239,7 @@ class ProxyUseCases:
                 return
         self._request_upstream_refresh(Opcode.CONFIG_REQ)
         self._mark_upstream_refresh()
-        logger.debug("background upstream refresh (stale_only=%s)", stale_only)
+        logger.info("upstream send: STATE_REQ (stale cache background refresh)")
 
     def _mark_upstream_refresh(self) -> None:
         self.state.last_upstream_refresh_at = time.monotonic()
@@ -159,9 +250,7 @@ class ProxyUseCases:
         op = frame[:1]
         if op not in _SNAPSHOT_OPCODES:
             return
-        if op == b"\xff":
-            self.state.snapshot = [f for f in self.state.snapshot if f[:1] != b"\xff"] + [frame]
-        elif op == b"\x01":
+        if op == b"\x01":
             self.state.snapshot = [f for f in self.state.snapshot if f[:1] != b"\x01"] + [frame]
         elif op == b"\x03":
             self.state.snapshot = [f for f in self.state.snapshot if f[:1] != b"\x03"] + [frame]

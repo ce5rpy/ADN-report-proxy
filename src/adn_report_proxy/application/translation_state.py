@@ -34,6 +34,11 @@ class TranslationState:
     topology_seq: int = 0
     routing_snapshot: dict[str, Any] | None = None
     routing_seq: int = 0
+    last_config: dict[str, Any] | None = None
+    last_dashboard_state: dict[str, Any] | None = None
+    known_masters: set[str] = field(default_factory=set)
+    inject_bases: set[str] = field(default_factory=set)
+    inject_max_peers: dict[str, int] = field(default_factory=dict)
     bridges_frame_sent: bool = False
 
     def reset(self) -> None:
@@ -42,4 +47,13 @@ class TranslationState:
         self.topology_seq = 0
         self.routing_snapshot = None
         self.routing_seq = 0
+        self.last_config = None
+        self.last_dashboard_state = None
+        self.known_masters.clear()
+        self.inject_bases.clear()
+        self.inject_max_peers.clear()
+        self.bridges_frame_sent = False
+
+    def on_upstream_lost(self) -> None:
+        """Keep legacy snapshots across upstream TCP churn (adn-server reconnects ~60s)."""
         self.bridges_frame_sent = False

@@ -74,6 +74,13 @@ class DownstreamBroadcasterImpl:
         for frame in frames:
             client.send_frame(frame)
 
+    def disconnect_all(self) -> None:
+        for proto in list(self._factory.active_protocols):
+            try:
+                proto.transport.loseConnection()
+            except Exception as e:
+                logger.debug("disconnect failed: %s", e)
+
 
 class LegacyMonitorFactory(Factory):
     protocol = LegacyMonitorProtocol

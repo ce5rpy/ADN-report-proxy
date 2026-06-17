@@ -55,6 +55,10 @@ class DownstreamBroadcaster(Protocol):
 
     def send_snapshot(self, client: Any, frames: list[bytes]) -> None: ...
 
+    def disconnect_all(self) -> None:
+        """Drop legacy monitor TCP sessions (dashboard clears CTABLE on reconnect)."""
+        ...
+
 
 class UpstreamReportHandler(Protocol):
     """Callback surface wired from the upstream TCP client."""

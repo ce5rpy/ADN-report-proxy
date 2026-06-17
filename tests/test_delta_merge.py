@@ -55,6 +55,29 @@ def test_topology_delta_emits_config_snd():
     assert "MASTER-B" in config
 
 
+def test_routing_delta_without_prior_snapshot_emits_bridge_snd():
+    mapper = V2ToV1Mapper()
+    delta = {
+        "type": "delta",
+        "since_seq": 5,
+        "patch": {
+            "type": "routing_table",
+            "seq": 6,
+            "routes": [
+                {
+                    "relay_table_key": "43:9:1",
+                    "legs": [{"system": "M2", "ts": 1, "tgid": 9, "active": False, "to_type": "OFF"}],
+                },
+            ],
+        },
+    }
+    frames = mapper.translate(Opcode.DELTA_SND, json.dumps(delta).encode())
+    assert len(frames) == 1
+    assert frames[0][:1] == Opcode.BRIDGE_SND
+    bridges = pickle.loads(frames[0][1:])
+    assert "43:9:1" in bridges
+
+
 def test_routing_delta_emits_bridge_snd_with_relay_table_key():
     mapper = V2ToV1Mapper()
     full = {
